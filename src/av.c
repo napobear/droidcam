@@ -8,12 +8,26 @@ extern int v_running;
 extern int thread_cmd;
 extern struct settings g_settings;
 
+void * DecodeThreadProc(void * args) {
+    dbgprint("Decode Thread Start\n");
+    while (v_running != 0){
+       JPGFrame *f = pull_ready_jpg_frame();
+       if (!f) {
+            usleep(2000);
+            continue;
+       }
+       process_frame(f);
+       push_jpg_frame(f, true);
+    }
+    dbgprint("Decode Thread End\n");
+    return 0;
+}
+
 void * VideoThreadProc(void * args) {
     char buf[32];
-    SOCKET videoSocket = (SOCKET) args;
+    SOCKET videoSocket = (SOCKET_PTR) args;
     int keep_waiting = 0;
     dbgprint("Video Thread Started s=%d\n", videoSocket);
-    v_running = 1;
 
 server_wait:
     if (videoSocket == INVALID_SOCKET) {
@@ -48,13 +62,14 @@ server_wait:
         }
 
         int frameLen;
-        struct jpg_frame_s *f = decoder_get_next_frame();
+        JPGFrame *f = pull_empty_jpg_frame();
         if (SendRecv(0, buf, 4, videoSocket) == FALSE) break;
         make_int4(frameLen, buf[0], buf[1], buf[2], buf[3]);
         f->length = frameLen;
         if (SendRecv(0, (char*)f->data, frameLen, videoSocket) == FALSE)
             break;
 
+        push_jpg_frame(f, false);
     }
 
 early_out:
@@ -88,10 +103,12 @@ void *AudioThreadProc(void *arg) {
     snd_pcm_t *handle = decoder_prepare_audio();
     transfer.first = 1;
     if (!handle) {
-        errprint("Audio device not available");
+        MSG_ERROR("Missing audio device");
         return 0;
     }
 
+    if (g_settings.connection == CB_RADIO_IOS)
+        goto TCP_ONLY;
     if (strncmp(g_settings.ip, ADB_LOCALHOST_IP, CSTR_LEN(ADB_LOCALHOST_IP)) == 0)
         goto TCP_ONLY;
 
@@ -116,8 +133,14 @@ void *AudioThreadProc(void *arg) {
 
 TCP_ONLY:
     dbgprint("UDP didnt work, trying TCP\n");
+    mode = TCP_STREAM;
+    if (g_settings.connection == CB_RADIO_IOS) {
+        socket = CheckiOSDevices(g_settings.port);
+        if (socket <= 0) socket = INVALID_SOCKET;
+    } else {
+        socket = Connect(g_settings.ip, g_settings.port);
+    }
 
-    socket = connect_droidcam(g_settings.ip, g_settings.port);
     if (socket == INVALID_SOCKET) {
         errprint("Audio: Connect failed to %s:%d\n", g_settings.ip, g_settings.port);
         return 0;
@@ -149,7 +172,6 @@ TCP_ONLY:
     }
 
     bytes_per_packet = CHUNKS_PER_PACKET * DROIDCAM_SPX_CHUNK_BYTES_2;
-    mode = TCP_STREAM;
 
 STREAM:
     while (a_running) {
@@ -186,8 +208,8 @@ STREAM:
         if (decode_buf_used == 0) {
             decoder_speex_plc(&transfer);
         } else {
-            short *output_buffer = transfer.my_areas->addr;
-            if (transfer.frames >= decoder_get_audio_frame_size()) {
+            short *output_buffer = (short *)transfer.my_areas->addr;
+            if ((int)transfer.frames >= decoder_get_audio_frame_size()) {
                 transfer.frames = decoder_get_audio_frame_size();
             }
             memcpy(&output_buffer[transfer.offset], decode_buf, transfer.frames * sizeof(short));
@@ -211,7 +233,12 @@ STREAM:
     }
 
 early_out:
-    disconnect(socket);
+    if (mode == UDP_STREAM)
+        SendUDPMessage(socket, STOP_REQ, CSTR_LEN(STOP_REQ), g_settings.ip, g_settings.port + 1);
+
+    if (socket > 0)
+        disconnect(socket);
+
     dbgprint("Audio Thread End\n");
     return 0;
 }

@@ -8,23 +8,29 @@
 
 #ifndef __DECODR_H__
 #define __DECODR_H__
+
+extern "C" {
 #include <alsa/asoundlib.h>
-
-typedef unsigned char BYTE;
-
-struct jpg_frame_s {
- BYTE *data;
- unsigned length;
-};
-
 struct snd_transfer_s {
     int first;
     snd_pcm_uframes_t offset;
     snd_pcm_uframes_t frames;
     const snd_pcm_channel_area_t *my_areas;
 };
+}
 
-int  decoder_init();
+typedef unsigned char BYTE;
+
+struct JPGFrame {
+    BYTE *data;
+    unsigned length;
+    JPGFrame(void) {
+        data = 0; length = 0;
+    }
+};
+
+
+int  decoder_init(const char* v4l2_device, unsigned v4l2_width, unsigned v4l2_height);
 void decoder_fini();
 
 snd_pcm_t * decoder_prepare_audio(void);
@@ -34,10 +40,14 @@ int decode_speex_frame(char *stream_buf, short *decode_buf, int droidcam_spx_chu
 int  decoder_prepare_video(char * header);
 void decoder_cleanup();
 
-struct jpg_frame_s* decoder_get_next_frame();
-void decoder_set_video_delay(unsigned v);
+JPGFrame* pull_empty_jpg_frame(void);
+JPGFrame* pull_ready_jpg_frame(void);
+void push_jpg_frame(JPGFrame*, bool empty);
+void process_frame(JPGFrame*);
 int decoder_get_video_width();
 int decoder_get_video_height();
+void decoder_horizontal_flip();
+void decoder_vertical_flip();
 void decoder_show_test_image();
 
 /* 20ms 16hkz 16 bit */
@@ -56,8 +66,10 @@ void decoder_show_test_image();
 #define VIDEO_FMT_DROIDCAM 3
 #define VIDEO_FMT_DROIDCAMX 18
 
-int find_droidcam_v4l();
-void query_droidcam_v4l(int droidcam_device_fd, int *WEBCAM_W, int *WEBCAM_H);
+void set_v4l2_device(const char* device);
+int open_v4l2_device(void);
+int find_v4l2_device(const char* bus_info);
+void query_v4l_device(int droidcam_device_fd, unsigned *WEBCAM_W, unsigned *WEBCAM_H);
 
 snd_pcm_t *find_snd_device(void);
 int snd_transfer_check(snd_pcm_t *handle, struct snd_transfer_s *transfer);

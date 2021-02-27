@@ -10,13 +10,12 @@
 #ifndef _COMMON_H_
 #define _COMMON_H_
 
-#define APP_VER_INT 110
-#define APP_VER_STR "1.1"
+#define APP_VER_INT 171
+#define APP_VER_STR "1.7.1"
 
 #define MSG_ERROR(str)     ShowError("Error",str)
 #define MSG_LASTERROR(str) ShowError(str,strerror(errno))
-
-extern void ShowError();
+void ShowError(const char*, const char*);
 
 #define ADB_LOCALHOST_IP "127.0.0.1"
 

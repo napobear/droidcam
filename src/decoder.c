@@ -16,12 +16,14 @@
 #include <errno.h>
 #include <linux/limits.h>
 
+#include "common.h"
+#include "decoder.h"
+#include "queue.h"
+
+extern "C" {
 #include "turbojpeg.h"
 #include "libswscale/swscale.h"
 #include "speex/speex.h"
-
-#include "common.h"
-#include "decoder.h"
 
 struct spx_decoder_s {
  snd_pcm_t *snd_handle;
@@ -32,11 +34,13 @@ struct spx_decoder_s {
 };
 
 struct jpg_dec_ctx_s {
+ int invert;
  int subsamp;
- int m_width, m_height;
+ int m_width, m_height; // stream WxH
+ int d_width, d_height; // decoded WxH (can be inverted)
  int m_Yuv420Size, m_ySize, m_uvSize;
  int m_webcamYuvSize, m_webcam_ySize, m_webcam_uvSize;;
- int m_NextFrame, m_NextSlot, m_BufferLimit, m_BufferedFrames;
+ size_t m_BufferLimit;
 
  BYTE *m_inBuf;         /* incoming stream */
  BYTE *m_decodeBuf;     /* decoded individual frames */
@@ -44,16 +48,32 @@ struct jpg_dec_ctx_s {
 
  struct SwsContext *swc;
  tjhandle tj;
+ tjhandle tjXform;
+ tjtransform transform;
+
+ BYTE*  tjDstSlice[4];
+ BYTE* swcSrcSlice[4];
+ BYTE* swcDstSlice[4];
+
+ int  tjDstStride[4];
+ int swcSrcStride[4];
+ int swcDstStride[4];
 };
 
-#define JPG_BACKBUF_MAX 10
-struct jpg_frame_s    jpg_frames[JPG_BACKBUF_MAX];
+}
+
+#define JPG_BACKBUF_MAX 3
+JPGFrame jpg_frames[JPG_BACKBUF_MAX];
+Queue<JPGFrame*> decodeQueue;
+Queue<JPGFrame*> recieveQueue;
+
 struct jpg_dec_ctx_s  jpg_decoder;
 struct spx_decoder_s  spx_decoder;
 
 #define WEBCAM_Wf ((float)WEBCAM_W)
 #define WEBCAM_Hf ((float)WEBCAM_H)
-static int WEBCAM_W, WEBCAM_H;
+static unsigned int WEBCAM_W, WEBCAM_H;
+
 static int droidcam_device_fd;
 static snd_output_t *output = NULL;
 
@@ -61,39 +81,48 @@ static void decoder_share_frame();
 
 #define FREE_OBJECT(obj, free_func) if(obj){dbgprint(" " #obj " %p\n", obj); free_func(obj); obj=NULL;}
 
-void decoder_set_video_delay(unsigned v) {
-    if (v > JPG_BACKBUF_MAX) v = JPG_BACKBUF_MAX;
-    else if (v < 1) v = 1;
-    jpg_decoder.m_BufferLimit = v;
-    dbgprint("buffer %d frames\n", jpg_decoder.m_BufferLimit);
-}
+int decoder_init(const char* v4l2_device, unsigned v4l2_width, unsigned v4l2_height) {
+    WEBCAM_W = v4l2_width;
+    WEBCAM_H = v4l2_height;
 
-int decoder_init(void) {
-    WEBCAM_W = 0;
-    WEBCAM_H = 0;
+    if (v4l2_device) {
+        set_v4l2_device(v4l2_device);
+        droidcam_device_fd = open_v4l2_device();
+    } else {
+        droidcam_device_fd = find_v4l2_device("platform:v4l2loopback_dc");
+        if (droidcam_device_fd < 0) {
+            // check for generic v4l2loopback device
+            droidcam_device_fd = find_v4l2_device("platform:v4l2loopback");
+        }
+    }
 
-    droidcam_device_fd = find_droidcam_v4l();
     if (droidcam_device_fd < 0) {
-        MSG_ERROR("Droidcam video device not found (/dev/video[0-9]).\n"
+        MSG_ERROR("Droidcam/v4l2loopback device not found (/dev/video[0-9]).\n"
                 "Did it install correctly?\n"
                 "If you had a kernel update, you may need to re-install.");
 
-        return 0;
-    }
-
-    query_droidcam_v4l(droidcam_device_fd, &WEBCAM_W, &WEBCAM_H);
-    dbgprint("WEBCAM_W=%d, WEBCAM_H=%d\n", WEBCAM_W, WEBCAM_H);
-    if (WEBCAM_W < 2 || WEBCAM_H < 2 || WEBCAM_W > 9999 || WEBCAM_H > 9999){
-        MSG_ERROR("Unable to query droidcam device for parameters");
-        return 0;
+        WEBCAM_W = 320;
+        WEBCAM_H = 240;
+        droidcam_device_fd = 0;
+    } else {
+        query_v4l_device(droidcam_device_fd, &WEBCAM_W, &WEBCAM_H);
+        dbgprint("WEBCAM_W=%d, WEBCAM_H=%d\n", WEBCAM_W, WEBCAM_H);
+        if (WEBCAM_W < 2 || WEBCAM_H < 2 || WEBCAM_W > 9999 || WEBCAM_H > 9999){
+            MSG_ERROR("Unable to query v4l2 device for correct parameters");
+            return 0;
+        }
     }
 
     memset(&jpg_decoder, 0, sizeof(struct jpg_dec_ctx_s));
     jpg_decoder.tj = NULL;
+    jpg_decoder.tjXform = NULL;
+    jpg_decoder.invert = (WEBCAM_W < WEBCAM_H);
+    jpg_decoder.transform.op = 0;
+    jpg_decoder.transform.options = TJXOPT_COPYNONE | TJXOPT_TRIM;
+    jpg_decoder.m_BufferLimit = 0;
     jpg_decoder.m_webcamYuvSize  = WEBCAM_W * WEBCAM_H * 3 / 2;
     jpg_decoder.m_webcam_ySize   = WEBCAM_W * WEBCAM_H;
     jpg_decoder.m_webcam_uvSize  = jpg_decoder.m_webcam_ySize / 4;
-    decoder_set_video_delay(0);
 
     if (snd_output_stdio_attach(&output, stdout, 0) < 0) {
         errprint("snd_output_stdio_attach failed\n");
@@ -104,7 +133,7 @@ int decoder_init(void) {
     spx_decoder.snd_handle = find_snd_device();
     if (!spx_decoder.snd_handle) {
         errprint("Audio loopback device not found.\n"
-                "Is snd_aloop loaded?");
+                "Is snd_aloop loaded?\n");
     }
 
     spx_decoder.audioBoostPerc = 100;
@@ -119,6 +148,7 @@ int decoder_init(void) {
 
 void decoder_fini() {
     if (droidcam_device_fd) close(droidcam_device_fd);
+    droidcam_device_fd = 0;
     decoder_cleanup();
 
     FREE_OBJECT(spx_decoder.snd_handle, snd_pcm_close);
@@ -135,6 +165,11 @@ int decoder_prepare_video(char * header) {
     make_int(jpg_decoder.m_width,  header[0], header[1]);
     make_int(jpg_decoder.m_height, header[2], header[3]);
 
+    if (droidcam_device_fd <= 0) {
+        MSG_ERROR("Missing video device");
+        return FALSE;
+    }
+
     if (jpg_decoder.m_width <= 0 || jpg_decoder.m_height <= 0) {
         MSG_ERROR("Invalid data stream!");
         return FALSE;
@@ -144,6 +179,22 @@ int decoder_prepare_video(char * header) {
     if (!jpg_decoder.tj) {
         MSG_ERROR("Error creating decoder!");
         return FALSE;
+    }
+
+    jpg_decoder.tjXform = tjInitTransform();
+    if (!jpg_decoder.tjXform) {
+        MSG_ERROR("Error creating transform!");
+        return FALSE;
+    }
+
+    if (jpg_decoder.invert) {
+        jpg_decoder.d_width = jpg_decoder.m_height;
+        jpg_decoder.d_height = jpg_decoder.m_width;
+        jpg_decoder.transform.op = TJXOP_ROT90;
+
+    } else {
+        jpg_decoder.d_width = jpg_decoder.m_width;
+        jpg_decoder.d_height = jpg_decoder.m_height;
     }
 
     dbgprint("Stream W=%d H=%d\n", jpg_decoder.m_width, jpg_decoder.m_height);
@@ -157,9 +208,32 @@ int decoder_prepare_video(char * header) {
     if (jpg_decoder.m_webcamYuvSize != jpg_decoder.m_Yuv420Size) {
         jpg_decoder.m_webcamBuf = (BYTE*)malloc(jpg_decoder.m_webcamYuvSize * sizeof(BYTE));
         jpg_decoder.swc = sws_getCachedContext(NULL,
-                jpg_decoder.m_width, jpg_decoder.m_height, AV_PIX_FMT_YUV420P, /* src */
+                jpg_decoder.d_width, jpg_decoder.d_height, AV_PIX_FMT_YUV420P, /* src */
                 WEBCAM_W, WEBCAM_H , AV_PIX_FMT_YUV420P, /* dst */
                 SWS_FAST_BILINEAR /* flags */, NULL, NULL, NULL);
+
+        int srcLen = jpg_decoder.d_width;
+        int dstLen = WEBCAM_W;
+
+        jpg_decoder.swcSrcStride[0] = srcLen;
+        jpg_decoder.swcSrcStride[1] = srcLen>>1;
+        jpg_decoder.swcSrcStride[2] = srcLen>>1;
+        jpg_decoder.swcSrcStride[3] = 0;
+
+        jpg_decoder.swcSrcSlice[0] = &jpg_decoder.m_decodeBuf[0];
+        jpg_decoder.swcSrcSlice[1] = jpg_decoder.swcSrcSlice[0] + jpg_decoder.m_ySize;
+        jpg_decoder.swcSrcSlice[2] = jpg_decoder.swcSrcSlice[1] + jpg_decoder.m_uvSize;
+        jpg_decoder.swcSrcSlice[3] = NULL;
+
+        jpg_decoder.swcDstStride[0] = dstLen;
+        jpg_decoder.swcDstStride[1] = dstLen>>1;
+        jpg_decoder.swcDstStride[2] = dstLen>>1;
+        jpg_decoder.swcDstStride[3] = 0;
+
+        jpg_decoder.swcDstSlice[0] = &jpg_decoder.m_webcamBuf[0];
+        jpg_decoder.swcDstSlice[1] = jpg_decoder.swcDstSlice[0] + jpg_decoder.m_webcam_ySize;
+        jpg_decoder.swcDstSlice[2] = jpg_decoder.swcDstSlice[1] + jpg_decoder.m_webcam_uvSize;
+        jpg_decoder.swcDstSlice[3] = NULL;
     }
 
     dbgprint("jpg: webcambuf: %p\n", jpg_decoder.m_webcamBuf);
@@ -170,9 +244,20 @@ int decoder_prepare_video(char * header) {
         jpg_frames[i].data = &jpg_decoder.m_inBuf[i*jpg_decoder.m_Yuv420Size];
         jpg_frames[i].length = 0;
         dbgprint("jpg: jpg_frames[%d]: %p\n", i, jpg_frames[i].data);
+        recieveQueue.add_item(&jpg_frames[i]);
     }
 
-    jpg_decoder.m_BufferedFrames  = jpg_decoder.m_NextFrame = jpg_decoder.m_NextSlot = 0;
+    int stride = jpg_decoder.d_width;
+    jpg_decoder.tjDstStride[0] = stride;
+    jpg_decoder.tjDstStride[1] = stride>>1;
+    jpg_decoder.tjDstStride[2] = stride>>1;
+    jpg_decoder.tjDstStride[3] = 0;
+
+    jpg_decoder.tjDstSlice[0] = jpg_decoder.m_decodeBuf;
+    jpg_decoder.tjDstSlice[1] = jpg_decoder.tjDstSlice[0] + jpg_decoder.m_ySize;
+    jpg_decoder.tjDstSlice[2] = jpg_decoder.tjDstSlice[1] + jpg_decoder.m_uvSize;
+    jpg_decoder.tjDstSlice[3] = NULL;
+
     return TRUE;
 }
 
@@ -188,12 +273,15 @@ void decoder_cleanup() {
     FREE_OBJECT(jpg_decoder.m_decodeBuf, free);
     FREE_OBJECT(jpg_decoder.m_webcamBuf, free);
     FREE_OBJECT(jpg_decoder.swc, sws_freeContext);
+    FREE_OBJECT(jpg_decoder.tjXform, tjDestroy);
     FREE_OBJECT(jpg_decoder.tj, tjDestroy);
+    recieveQueue.clear();
+    decodeQueue.clear();
 }
 
-static void decode_next_frame() {
-    BYTE *p = jpg_frames[jpg_decoder.m_NextFrame].data;
-    unsigned long len = (unsigned long)jpg_frames[jpg_decoder.m_NextFrame].length;
+void process_frame(JPGFrame *frame) {
+    unsigned long len = (unsigned long)frame->length;
+    BYTE *p = frame->data;
 
     if (jpg_decoder.subsamp == 0) {
         int width, height, subsamp, colorspace;
@@ -218,21 +306,16 @@ static void decode_next_frame() {
         jpg_decoder.subsamp = subsamp;
     }
 
-    BYTE* dstSlice[4];
-    int dstStride[4] = {
-        jpg_decoder.m_width,
-        jpg_decoder.m_width>>1,
-        jpg_decoder.m_width>>1,
-    0};
-
-    dstSlice[0] = jpg_decoder.m_decodeBuf;
-    dstSlice[1] = dstSlice[0] + jpg_decoder.m_ySize;
-    dstSlice[2] = dstSlice[1] + jpg_decoder.m_uvSize;
-    dstSlice[3] = NULL;
+    if (jpg_decoder.transform.op) {
+        if (tjTransform(jpg_decoder.tjXform, p, len, 1, &p, &len, &jpg_decoder.transform, 0)) {
+            errprint("tjTransform failure: %s\n", tjGetErrorStr());
+            return;
+        }
+    }
 
     if (tjDecompressToYUVPlanes(jpg_decoder.tj, p, len,
-            dstSlice, jpg_decoder.m_width,
-            dstStride, jpg_decoder.m_height,
+            jpg_decoder.tjDstSlice, jpg_decoder.d_width,
+            jpg_decoder.tjDstStride, jpg_decoder.d_height,
             TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE))
     {
         errprint("tjDecompressToYUV2 failure: %d\n", tjGetErrorCode(jpg_decoder.tj));
@@ -246,35 +329,20 @@ static void decode_next_frame() {
 static void decoder_share_frame() {
     BYTE *p = jpg_decoder.m_decodeBuf;
     if (jpg_decoder.swc != NULL) {
-        uint8_t* srcSlice[4];
-        uint8_t* dstSlice[4];
+        sws_scale(jpg_decoder.swc,
+            (const uint8_t * const*) jpg_decoder.swcSrcSlice,
+            jpg_decoder.swcSrcStride,
+            0,
+            jpg_decoder.d_height,
+            jpg_decoder.swcDstSlice,
+            jpg_decoder.swcDstStride);
 
-        int srcStride[4] = {
-            jpg_decoder.m_width,
-            jpg_decoder.m_width>>1,
-            jpg_decoder.m_width>>1,
-        0};
-        int dstStride[4] = {
-            WEBCAM_W,
-            WEBCAM_W>>1,
-            WEBCAM_W>>1,
-        0};
-
-        srcSlice[0] = &jpg_decoder.m_decodeBuf[0];
-        srcSlice[1] = srcSlice[0] + jpg_decoder.m_ySize;
-        srcSlice[2] = srcSlice[1] + jpg_decoder.m_uvSize;
-        srcSlice[3] = NULL;
-        dstSlice[0] = &jpg_decoder.m_webcamBuf[0];
-        dstSlice[1] = dstSlice[0] + jpg_decoder.m_webcam_ySize;
-        dstSlice[2] = dstSlice[1] + jpg_decoder.m_webcam_uvSize;
-        dstSlice[3] = NULL;
-
-        sws_scale(jpg_decoder.swc, (const uint8_t * const*)srcSlice, srcStride, 0, jpg_decoder.m_height, dstSlice, dstStride);
         p = jpg_decoder.m_webcamBuf;
     }
 
     write(droidcam_device_fd, p, jpg_decoder.m_webcamYuvSize);
 }
+
 
 void decoder_show_test_image() {
     int i,j;
@@ -313,35 +381,51 @@ void decoder_show_test_image() {
     decoder_share_frame();
 }
 
-struct jpg_frame_s* decoder_get_next_frame() {
-    while (jpg_decoder.m_BufferedFrames > jpg_decoder.m_BufferLimit) {
-        jpg_decoder.m_BufferedFrames--;
-        jpg_decoder.m_NextFrame = (jpg_decoder.m_NextFrame < (JPG_BACKBUF_MAX-1)) ? (jpg_decoder.m_NextFrame + 1) : 0;
-    }
-    if (jpg_decoder.m_BufferedFrames == jpg_decoder.m_BufferLimit) {
-        // dbgprint("decoding #%2d (have buffered: %d)\n", jpg_decoder.m_NextFrame, jpg_decoder.m_BufferedFrames);
-        decode_next_frame();
-        jpg_decoder.m_BufferedFrames--;
-        jpg_decoder.m_NextFrame = (jpg_decoder.m_NextFrame < (JPG_BACKBUF_MAX-1)) ? (jpg_decoder.m_NextFrame + 1) : 0;
-    }
+void push_jpg_frame(JPGFrame* frame, bool empty) {
+    if (empty || recieveQueue.items.size() == 0 || decodeQueue.items.size() > jpg_decoder.m_BufferLimit)
+        recieveQueue.add_item(frame);
+    else
+        decodeQueue.add_item(frame);
+}
 
-    // a call to this function assumes we are about to get a full frame (or exit on failure).
-    // so increment the # of buffered frames. do this after the while() loop above to
-    // take care of the initial case:
-    jpg_decoder.m_BufferedFrames ++;
+JPGFrame* pull_empty_jpg_frame(void) {
+    return recieveQueue.next_item();
+}
 
-    int nextSlotSaved = jpg_decoder.m_NextSlot;
-    jpg_decoder.m_NextSlot = (jpg_decoder.m_NextSlot < (JPG_BACKBUF_MAX-1)) ? (jpg_decoder.m_NextSlot + 1) : 0;
-    // dbgprint("next image going to #%2d (have buffered: %d)\n", nextSlotSaved, (jpg_decoder.m_BufferedFrames-1));
-    return &jpg_frames[nextSlotSaved];
+JPGFrame* pull_ready_jpg_frame(void) {
+    return decodeQueue.next_item(jpg_decoder.m_BufferLimit);
 }
 
 int decoder_get_video_width() {
     return WEBCAM_W;
 }
 
-int decoder_get_video_height(){
+int decoder_get_video_height() {
     return WEBCAM_H;
+}
+
+void decoder_horizontal_flip() {
+    int h_flip  = (jpg_decoder.transform.op == TJXOP_HFLIP);
+    int v_flip  = (jpg_decoder.transform.op == TJXOP_VFLIP);
+    int hv_flip = (jpg_decoder.transform.op == TJXOP_ROT180);
+
+    if (h_flip || hv_flip) {
+        jpg_decoder.transform.op = hv_flip ? TJXOP_VFLIP : TJXOP_NONE;
+    } else {
+        jpg_decoder.transform.op = v_flip ? TJXOP_ROT180 : TJXOP_HFLIP;
+    }
+}
+
+void decoder_vertical_flip() {
+    int h_flip  = (jpg_decoder.transform.op == TJXOP_HFLIP);
+    int v_flip  = (jpg_decoder.transform.op == TJXOP_VFLIP);
+    int hv_flip = (jpg_decoder.transform.op == TJXOP_ROT180);
+
+    if (v_flip || hv_flip) {
+        jpg_decoder.transform.op = hv_flip ? TJXOP_HFLIP : TJXOP_NONE;
+    } else {
+        jpg_decoder.transform.op = h_flip ? TJXOP_ROT180 : TJXOP_VFLIP;
+    }
 }
 
 int decoder_get_audio_frame_size(void) {
@@ -349,8 +433,8 @@ int decoder_get_audio_frame_size(void) {
 }
 
 void decoder_speex_plc(struct snd_transfer_s* transfer) {
-    short *output_buffer = transfer->my_areas->addr;
-    if (transfer->frames >= spx_decoder.frame_size){
+    short *output_buffer = (short *)transfer->my_areas->addr;
+    if ((int)transfer->frames >= spx_decoder.frame_size){
         speex_decode_int(spx_decoder.state, NULL, &output_buffer[transfer->offset]);
         transfer->frames = spx_decoder.frame_size;
     } else {

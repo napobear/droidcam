@@ -198,7 +198,7 @@ int snd_transfer_check(snd_pcm_t *handle, struct snd_transfer_s *transfer) {
             err = snd_pcm_wait(handle, 2000);
             if (err < 0) {
                 if ((err = xrun_recovery(handle, err)) < 0) {
-                    printf("snd_pcm_wait error: %s\n", snd_strerror(err));
+                    errprint("snd_pcm_wait error: %s\n", snd_strerror(err));
                     return err;
                 }
                 transfer->first = 1;
@@ -211,7 +211,7 @@ int snd_transfer_check(snd_pcm_t *handle, struct snd_transfer_s *transfer) {
     err = snd_pcm_mmap_begin(handle, &transfer->my_areas, &transfer->offset, &transfer->frames);
     if (err < 0) {
         if ((err = xrun_recovery(handle, err)) < 0) {
-            printf("MMAP begin avail error: %s\n", snd_strerror(err));
+            errprint("MMAP begin avail error: %s\n", snd_strerror(err));
             return err;
         }
         transfer->first = 1;
@@ -227,7 +227,7 @@ int snd_transfer_commit(snd_pcm_t *handle, struct snd_transfer_s *transfer) {
     // dbgprint("commited %ld/%ld frames\n", commits, transfer->frames);
     if (commits < 0 || (snd_pcm_uframes_t)commits != transfer->frames) {
         if ((err = xrun_recovery(handle, commits >= 0 ? -EPIPE : commits)) < 0) {
-            printf("MMAP commit error: %s\n", snd_strerror(err));
+            errprint("MMAP commit error: %s\n", snd_strerror(err));
             return err;
         }
         transfer->first = 1;
@@ -268,13 +268,13 @@ snd_pcm_t *find_snd_device(void) {
             // got a handle
 
             if (set_hwparams(handle, hwparams, SND_PCM_ACCESS_MMAP_INTERLEAVED) < 0) {
-                errprint("setting audio hwparams failed: %s\n", snd_strerror(err));
+                errprint("setting audio hwparams failed\n");
                 snd_pcm_close(handle);
                 goto OUT;
             }
 
             if (set_swparams(handle, swparams) < 0) {
-                errprint("Setting audio swparams failed: %s\n", snd_strerror(err));
+                errprint("Setting audio swparams failed\n");
                 snd_pcm_close(handle);
                 goto OUT;
             }
